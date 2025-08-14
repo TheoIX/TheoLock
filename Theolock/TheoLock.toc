@@ -1,0 +1,6 @@
+## Interface: 11200
+## Title: TheoLock
+## Notes: Smart cast helper for Warlock (Turtle WoW 1.12)
+## Author: You
+## Version: 0.1
+TheoLock.lua
