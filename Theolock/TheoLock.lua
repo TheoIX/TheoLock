@@ -1,4 +1,4 @@
--- TheoLock - Warlock smart-cast (Turtle WoW 1.12-safe) + pfUI fallback scan
+-- TheoLock - Warlock smart-cast (Turtle WoW 1.12-safe) + robust DoT detection
 
 local TheoLock = CreateFrame("Frame", "TheoLockFrame")
 TheoLock.isChanneling = false
@@ -13,6 +13,9 @@ TheoLock.pfTargetFrame = nil
 TheoLock.pfLastScan = 0
 TheoLock.pfScanCooldown = 0.25 -- seconds between heavy frame enumerations
 
+-- nudge logic: after casting Corruption, prefer CoA on next pulse
+TheoLock.preferCoAUntil = 0
+
 -- -------- Utils --------
 local function pct(unit)
     local hp, max = UnitHealth(unit), UnitHealthMax(unit)
@@ -22,13 +25,12 @@ end
 
 local function normalizeAuraName(s)
     if not s then return nil end
-    -- Strip trailing parenthetical suffixes like " (Rank 3)"
-    s = string.gsub(s, "%s*%b()", "")
+    s = string.gsub(s, "%s*%b()", "") -- strip " (Rank X)"
     return s
 end
 
 local function recentlyCast(spell, window)
-    window = window or 2.0
+    window = window or 3.0
     return (TheoLock.lastCastName == spell) and ((GetTime() - (TheoLock.lastCastAt or 0)) < window)
 end
 
@@ -52,11 +54,31 @@ local function AuraNameAt(unit, index, isDebuff)
 end
 
 local function escapePattern(s)
-    -- escape Lua pattern magic chars
     return (string.gsub(s, "([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
 end
 
-local function HasDebuff(unit, name)
+-- -------- Debuff detection: ICON -> TOOLTIP -> pfUI fallback --------
+-- Known icon keys (tail of the texture path) on 1.12
+local DOT_ICON_TAIL = {
+    ["Corruption"]       = "Spell_Shadow_AbominationExplosion",
+    ["Curse of Agony"]   = "Spell_Shadow_CurseOfSargeras",
+}
+
+local function HasDebuffByIcon(unit, spell)
+    local key = DOT_ICON_TAIL[spell]
+    if not key then return false end
+    for i = 1, 16 do
+        local tex = UnitDebuff(unit, i)
+        if not tex then break end
+        -- match end of path to be robust across interface paths
+        if string.find(tex, key, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function HasDebuffByTooltip(unit, name)
     if not UnitExists(unit) then return false end
     name = normalizeAuraName(name)
     local prefix = "^" .. escapePattern(name)
@@ -86,10 +108,8 @@ local function HasBuff(unit, name)
     return false
 end
 
--- -------- pfUI fallback scanning --------
--- We try to find pfUI's target frame once and cache it.
+-- -------- pfUI fallback scanning (last resort) --------
 local function findPfTargetFrame()
-    -- quick direct guesses first (cheap)
     local guessNames = { "pfTarget", "pfUITarget", "pfUI.uf.target", "pfUITargetFrame", "pfUnitFrameTarget" }
     for _, n in ipairs(guessNames) do
         local f = getglobal(n)
@@ -97,21 +117,18 @@ local function findPfTargetFrame()
             return f
         end
     end
-
-    -- throttle expensive enumeration
     local now = GetTime()
     if (now - (TheoLock.pfLastScan or 0)) < TheoLock.pfScanCooldown then
         return TheoLock.pfTargetFrame
     end
     TheoLock.pfLastScan = now
-
-    -- brute force: enumerate all frames and pick a likely pf target frame
     if EnumerateFrames then
         local f = EnumerateFrames()
         while f do
             if f.GetName and f:GetName() then
                 local nm = string.lower(f:GetName())
-                if string.find(nm, "pf") and string.find(nm, "target") and f.GetObjectType and f:GetObjectType() == "Frame" then
+                if string.find(nm, "pf", 1, true) and string.find(nm, "target", 1, true)
+                   and f.GetObjectType and f:GetObjectType() == "Frame" then
                     TheoLock.pfTargetFrame = f
                     return f
                 end
@@ -122,13 +139,10 @@ local function findPfTargetFrame()
     return TheoLock.pfTargetFrame
 end
 
--- recursively check any FontString text within a frame & its children
 local function frameTreeHasText(frame, needleLower)
     if not frame or not frame.IsShown or not frame:IsShown() then return false end
-
-    -- regions: textures / fontstrings
-    local r1, r2, r3, r4, r5, r6, r7, r8 = frame:GetRegions()
-    local regions = { r1, r2, r3, r4, r5, r6, r7, r8 }
+    local r1,r2,r3,r4,r5,r6,r7,r8 = frame:GetRegions()
+    local regions = { r1,r2,r3,r4,r5,r6,r7,r8 }
     for _, r in ipairs(regions) do
         if r and r.GetObjectType and r:GetObjectType() == "FontString" then
             local t = r:GetText()
@@ -137,38 +151,29 @@ local function frameTreeHasText(frame, needleLower)
             end
         end
     end
-
-    -- children: recurse
-    local c = { frame:GetChildren() }
-    for _, child in ipairs(c) do
-        if frameTreeHasText(child, needleLower) then
-            return true
-        end
+    local children = { frame:GetChildren() }
+    for _, child in ipairs(children) do
+        if frameTreeHasText(child, needleLower) then return true end
     end
-
     return false
 end
 
--- Check pfUI target frame for a raw string (case-insensitive).
 local function pfuiTargetHasString(str)
     local f = TheoLock.pfTargetFrame or findPfTargetFrame()
     if not f then return false end
     return frameTreeHasText(f, string.lower(str))
 end
 
--- Wrapper for DoT checks that falls back to pfUI string scan (target only).
-local function TargetHasDotWithFallback(dotName)
-    -- 1) normal tooltip-based scan
-    if HasDebuff("target", dotName) then return true end
-
-    -- 2) pfUI fallback only for specific DoTs
+local function TargetHasDotRobust(dotName)
+    -- 1) Icon texture (most reliable and fast)
+    if HasDebuffByIcon("target", dotName) then return true end
+    -- 2) Tooltip name scan (rank-agnostic)
+    if HasDebuffByTooltip("target", dotName) then return true end
+    -- 3) pfUI frame text fallback (last resort)
     local n = normalizeAuraName(dotName)
     if n == "Corruption" or n == "Curse of Agony" then
-        if pfuiTargetHasString(n) then
-            return true
-        end
+        if pfuiTargetHasString(n) then return true end
     end
-
     return false
 end
 
@@ -184,6 +189,10 @@ local function cast(spell)
     CastSpellByName(spell)
     TheoLock.lastCastName = spell
     TheoLock.lastCastAt = GetTime()
+    -- hint: if we just applied Corruption, prefer CoA next for a short window
+    if spell == "Corruption" then
+        TheoLock.preferCoAUntil = GetTime() + 3.0
+    end
     return true
 end
 
@@ -198,7 +207,6 @@ TheoLock:SetScript("OnEvent", function()
         TheoLock.isChanneling = false
         TheoLock.channelSpell = nil
     elseif event == "SPELLCAST_START" then
-        -- any new cast cancels channel state
         TheoLock.isChanneling = false
         TheoLock.channelSpell = nil
     end
@@ -215,11 +223,19 @@ function TheoLock:Pulse()
         return
     end
 
-    -- TOP PRIO: Keep DoTs up (Corruption -> Curse of Agony), using pfUI fallback if needed
-    if safeHostileTarget() and not TargetHasDotWithFallback("Corruption") and not recentlyCast("Corruption", 2.5) then
+    -- TOP PRIO: Keep DoTs up (Corruption -> Curse of Agony)
+    if safeHostileTarget() and not TargetHasDotRobust("Corruption") and not recentlyCast("Corruption", 3.0) then
         if cast("Corruption") then return end
     end
-    if safeHostileTarget() and not TargetHasDotWithFallback("Curse of Agony") and not recentlyCast("Curse of Agony", 2.5) then
+
+    -- If we recently applied Corruption, strongly try CoA next if it’s missing
+    if safeHostileTarget() and GetTime() < (TheoLock.preferCoAUntil or 0)
+       and not TargetHasDotRobust("Curse of Agony") and not recentlyCast("Curse of Agony", 3.0) then
+        if cast("Curse of Agony") then return end
+    end
+
+    -- Regular CoA upkeep (if not already caught by the preference above)
+    if safeHostileTarget() and not TargetHasDotRobust("Curse of Agony") and not recentlyCast("Curse of Agony", 3.0) then
         if cast("Curse of Agony") then return end
     end
 
@@ -230,7 +246,7 @@ function TheoLock:Pulse()
 
     -- Pet safety: Health Funnel if pet exists and <50%
     if UnitExists("pet") and not UnitIsDeadOrGhost("pet") and pct("pet") < 0.50 then
-        TheoLock.channelSpell = "Health Funnel" -- prime guard for cores without arg1
+        TheoLock.channelSpell = "Health Funnel"
         if cast("Health Funnel") then return end
     end
 
@@ -251,16 +267,15 @@ SlashCmdList["THEOLOCK"] = function(msg)
     msg = string.lower(msg or "")
     if msg == "status" then
         DEFAULT_CHAT_FRAME:AddMessage(string.format(
-            "TheoLock: channeling=%s (%s) | lastCast=%s age=%.1fs | pfTarget=%s",
+            "TheoLock: chann=%s (%s) | last=%s age=%.1fs | preferCoA=%.1fs | pfTarget=%s",
             tostring(TheoLock.isChanneling),
             tostring(TheoLock.channelSpell or "none"),
             tostring(TheoLock.lastCastName or "none"),
             (GetTime() - (TheoLock.lastCastAt or 0)),
+            math.max(0, (TheoLock.preferCoAUntil or 0) - GetTime()),
             tostring((TheoLock.pfTargetFrame and (TheoLock.pfTargetFrame:GetName() or "unnamed")) or "nil")
         ))
         return
     end
     TheoLock:Pulse()
 end
-
-
