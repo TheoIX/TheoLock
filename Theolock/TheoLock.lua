@@ -62,6 +62,7 @@ end
 local DOT_ICON_TAIL = {
     ["Corruption"]       = "Spell_Shadow_AbominationExplosion",
     ["Curse of Agony"]   = "Spell_Shadow_CurseOfSargeras",
+    ["Siphon Life"]      = "Spell_Shadow_Requiem",
 }
 
 local function HasDebuffByIcon(unit, spell)
@@ -141,8 +142,8 @@ end
 
 local function frameTreeHasText(frame, needleLower)
     if not frame or not frame.IsShown or not frame:IsShown() then return false end
-    local r1,r2,r3,r4,r5,r6,r7,r8 = frame:GetRegions()
-    local regions = { r1,r2,r3,r4,r5,r6,r7,r8 }
+    -- scan this frame's fontstrings
+    local regions = { frame:GetRegions() }
     for _, r in ipairs(regions) do
         if r and r.GetObjectType and r:GetObjectType() == "FontString" then
             local t = r:GetText()
@@ -151,6 +152,7 @@ local function frameTreeHasText(frame, needleLower)
             end
         end
     end
+    -- scan children
     local children = { frame:GetChildren() }
     for _, child in ipairs(children) do
         if frameTreeHasText(child, needleLower) then return true end
@@ -171,7 +173,7 @@ local function TargetHasDotRobust(dotName)
     if HasDebuffByTooltip("target", dotName) then return true end
     -- 3) pfUI frame text fallback (last resort)
     local n = normalizeAuraName(dotName)
-    if n == "Corruption" or n == "Curse of Agony" then
+    if n == "Corruption" or n == "Curse of Agony" or n == "Siphon Life" then
         if pfuiTargetHasString(n) then return true end
     end
     return false
@@ -223,7 +225,7 @@ function TheoLock:Pulse()
         return
     end
 
-    -- TOP PRIO: Keep DoTs up (Corruption -> Curse of Agony)
+    -- TOP PRIO: Keep DoTs up (Corruption -> CoA -> Siphon Life)
     if safeHostileTarget() and not TargetHasDotRobust("Corruption") and not recentlyCast("Corruption", 3.0) then
         if cast("Corruption") then return end
     end
@@ -237,6 +239,11 @@ function TheoLock:Pulse()
     -- Regular CoA upkeep (if not already caught by the preference above)
     if safeHostileTarget() and not TargetHasDotRobust("Curse of Agony") and not recentlyCast("Curse of Agony", 3.0) then
         if cast("Curse of Agony") then return end
+    end
+
+    -- Siphon Life upkeep (same priority bucket as CoA, above fillers)
+    if safeHostileTarget() and not TargetHasDotRobust("Siphon Life") and not recentlyCast("Siphon Life", 3.0) then
+        if cast("Siphon Life") then return end
     end
 
     -- Nightfall proc: Shadow Bolt (buff is "Shadow Trance" on 1.12)
@@ -255,9 +262,15 @@ function TheoLock:Pulse()
         if cast("Drain Life") then return end
     end
 
-    -- Fallback
+    -- Filler / Execute: ONLY Drain Soul if all three DoTs are present
     if safeHostileTarget() then
-        cast("Drain Soul")
+        local hasCorr = TargetHasDotRobust("Corruption")
+        local hasCoA  = TargetHasDotRobust("Curse of Agony")
+        local hasSL   = TargetHasDotRobust("Siphon Life")
+        if hasCorr and hasCoA and hasSL then
+            cast("Drain Soul")
+        end
+        -- else: do nothing; next press will attempt to (re)apply missing DoTs
     end
 end
 
