@@ -1,33 +1,29 @@
 -- TheoLock - Warlock smart-cast (Turtle WoW 1.12-safe)
--- Additions in this version:
---  * "recent cast" throttle reduced from 3.0s to 1.4s
---  * Nightfall (Shadow Trance) moved to absolute top priority
---  * Toggleable PvP mode (/lockbg):
---      - vs WARRIOR/PALADIN/HUNTER/ROGUE => top-prio Curse of Exhaustion (if missing)
---      - vs MAGE/WARLOCK/PRIEST/DRUID/SHAMAN => top-prio Curse of Tongues (if missing)
---  * NEW: Adds Curse of the Elements detection + priority above Corruption/CoA/Siphon Life
---    (All other logic unchanged; DoT upkeep and fillers proceed as usual.)
+-- Rewritten to mirror the warrior script style:
+--  * One function per spell / ability
+--  * Main handler calls them in priority order
+--  * DoTs/curses are driven ONLY by actual debuffs on the target
+--  * No "recentlyCast" throttle -> resists are handled naturally
 
 local TheoLock = CreateFrame("Frame", "TheoLockFrame")
-TheoLock.isChanneling = false
-TheoLock.channelSpell = nil
 
--- Track last cast to avoid instant re-casts while auras apply
-TheoLock.lastCastName = nil
-TheoLock.lastCastAt = 0
+TheoLock.isChanneling   = false
+TheoLock.channelSpell   = nil
+
+-- Last cast info (for /theolock status only)
+TheoLock.lastCastName   = nil
+TheoLock.lastCastAt     = 0
 
 -- pfUI target frame cache
-TheoLock.pfTargetFrame = nil
-TheoLock.pfLastScan = 0
+TheoLock.pfTargetFrame  = nil
+TheoLock.pfLastScan     = 0
 TheoLock.pfScanCooldown = 0.25 -- seconds between heavy frame enumerations
 
--- nudge logic: after casting Corruption, prefer CoA on next pulse
-TheoLock.preferCoAUntil = 0
+-- PvP mode toggle: /lockbg
+TheoLock.pvpMode        = false
 
--- PvP mode toggle
-TheoLock.pvpMode = false
+-- -------- Small utils --------
 
--- -------- Utils --------
 local function pct(unit)
     local hp, max = UnitHealth(unit), UnitHealthMax(unit)
     if not hp or not max or max == 0 then return 1 end
@@ -36,13 +32,9 @@ end
 
 local function normalizeAuraName(s)
     if not s then return nil end
-    s = string.gsub(s, "%s*%b()", "") -- strip " (Rank X)"
+    -- Strip " (Rank X)" etc
+    s = string.gsub(s, "%s*%b()", "")
     return s
-end
-
-local function recentlyCast(spell, window)
-    window = window or 1.4 -- reduced from 3.0s -> 1.4s
-    return (TheoLock.lastCastName == spell) and ((GetTime() - (TheoLock.lastCastAt or 0)) < window)
 end
 
 -- Hidden tooltip for aura name scanning (1.12-safe)
@@ -69,14 +61,15 @@ local function escapePattern(s)
 end
 
 -- -------- Debuff detection: ICON -> TOOLTIP -> pfUI fallback --------
+
 -- Known icon keys (tail of the texture path) on 1.12
 local DOT_ICON_TAIL = {
-    ["Corruption"]              = "Spell_Shadow_AbominationExplosion",
-    ["Curse of Agony"]          = "Spell_Shadow_CurseOfSargeras",
-    ["Siphon Life"]             = "Spell_Shadow_Requiem",
-    ["Curse of Exhaustion"]     = "Spell_Shadow_GrimWard",          -- user-supplied
-    ["Curse of Tongues"]        = "Spell_Shadow_CurseOfTounges",     -- user-supplied (note texture spelling)
-    ["Curse of the Elements"]   = "Spell_Shadow_ChillTouch",         -- new
+    ["Corruption"]            = "Spell_Shadow_AbominationExplosion",
+    ["Curse of Agony"]        = "Spell_Shadow_CurseOfSargeras",
+    ["Siphon Life"]           = "Spell_Shadow_Requiem",
+    ["Curse of Exhaustion"]   = "Spell_Shadow_GrimWard",
+    ["Curse of Tongues"]      = "Spell_Shadow_CurseOfTounges", -- note spelling
+    ["Curse of the Elements"] = "Spell_Shadow_ChillTouch",
 }
 
 local function HasDebuffByIcon(unit, spell)
@@ -123,6 +116,7 @@ local function HasBuff(unit, name)
 end
 
 -- -------- pfUI fallback scanning (last resort) --------
+
 local function findPfTargetFrame()
     local guessNames = { "pfTarget", "pfUITarget", "pfUI.uf.target", "pfUITargetFrame", "pfUnitFrameTarget" }
     for _, n in ipairs(guessNames) do
@@ -131,11 +125,13 @@ local function findPfTargetFrame()
             return f
         end
     end
+
     local now = GetTime()
     if (now - (TheoLock.pfLastScan or 0)) < TheoLock.pfScanCooldown then
         return TheoLock.pfTargetFrame
     end
     TheoLock.pfLastScan = now
+
     if EnumerateFrames then
         local f = EnumerateFrames()
         while f do
@@ -155,6 +151,7 @@ end
 
 local function frameTreeHasText(frame, needleLower)
     if not frame or not frame.IsShown or not frame:IsShown() then return false end
+
     local regions = { frame:GetRegions() }
     for _, r in ipairs(regions) do
         if r and r.GetObjectType and r:GetObjectType() == "FontString" then
@@ -164,10 +161,14 @@ local function frameTreeHasText(frame, needleLower)
             end
         end
     end
+
     local children = { frame:GetChildren() }
     for _, child in ipairs(children) do
-        if frameTreeHasText(child, needleLower) then return true end
+        if frameTreeHasText(child, needleLower) then
+            return true
+        end
     end
+
     return false
 end
 
@@ -177,46 +178,63 @@ local function pfuiTargetHasString(str)
     return frameTreeHasText(f, string.lower(str))
 end
 
+-- Robust "does the target have this DoT/curse?" check.
 local function TargetHasDotRobust(dotName)
+    if not UnitExists("target") then return false end
+
+    -- First: icon + tooltip
     if HasDebuffByIcon("target", dotName) then return true end
     if HasDebuffByTooltip("target", dotName) then return true end
+
+    -- Fallback: pfUI text scan, using normalized name
     local n = normalizeAuraName(dotName)
-    if n == "Corruption" or n == "Curse of Agony" or n == "Siphon Life" or n == "Curse of Exhaustion" or n == "Curse of Tongues" or n == "Curse of the Elements" then
-        if pfuiTargetHasString(n) then return true end
+    if n and pfuiTargetHasString(n) then
+        return true
     end
+
     return false
+end
+
+-- Any warlock curse currently on the target?
+local function TargetHasAnyWarlockCurse()
+    return TargetHasDotRobust("Curse of Agony")
+        or TargetHasDotRobust("Curse of Exhaustion")
+        or TargetHasDotRobust("Curse of Tongues")
+        or TargetHasDotRobust("Curse of the Elements")
 end
 
 local function safeHostileTarget()
     return UnitExists("target") and not UnitIsDeadOrGhost("target") and UnitCanAttack("player", "target")
 end
 
+-- Generic cast wrapper: respects Health Funnel channel, updates lastCast info
 local function cast(spell)
     -- Do not interrupt Health Funnel once channeling
     if TheoLock.isChanneling and TheoLock.channelSpell == "Health Funnel" then
         return true
     end
+
     CastSpellByName(spell)
     TheoLock.lastCastName = spell
-    TheoLock.lastCastAt = GetTime()
-    -- hint: if we just applied Corruption, prefer CoA next for a short window (reduced to 1.4s)
-    if spell == "Corruption" then
-        TheoLock.preferCoAUntil = GetTime() + 1.4
-    end
+    TheoLock.lastCastAt   = GetTime()
     return true
 end
 
 -- -------- Events (1.12 uses globals 'event', 'arg1', ...) --------
+
 TheoLock:SetScript("OnEvent", function()
     if event == "SPELLCAST_CHANNEL_START" then
         TheoLock.isChanneling = true
         if arg1 and arg1 ~= "" then
             TheoLock.channelSpell = arg1
         end
+
     elseif event == "SPELLCAST_CHANNEL_STOP" then
         TheoLock.isChanneling = false
         TheoLock.channelSpell = nil
+
     elseif event == "SPELLCAST_START" then
+        -- Non-channel casts reset the channel state
         TheoLock.isChanneling = false
         TheoLock.channelSpell = nil
     end
@@ -226,111 +244,166 @@ TheoLock:RegisterEvent("SPELLCAST_CHANNEL_START")
 TheoLock:RegisterEvent("SPELLCAST_CHANNEL_STOP")
 TheoLock:RegisterEvent("SPELLCAST_START")
 
--- -------- Core logic --------
+-- =====================================================================
+--  ROTATION ABILITY FUNCTIONS (one per spell, like warrior script)
+-- =====================================================================
+
+-- 1) Nightfall proc: Shadow Trance → instant Shadow Bolt
+local function CastNightfallShadowBolt()
+    if not safeHostileTarget() then return false end
+    if not HasBuff("player", "Shadow Trance") then return false end
+    return cast("Shadow Bolt")
+end
+
+-- 2) PvP mode: class-targeted disruptive curse (after Nightfall)
+local function CastPvPCurse()
+    if not TheoLock.pvpMode then return false end
+    if not safeHostileTarget() then return false end
+
+    local _, classFile = UnitClass("target")
+    if not classFile then return false end
+
+    local melee  = { WARRIOR=true, PALADIN=true, HUNTER=true, ROGUE=true }
+    local casters = { MAGE=true, WARLOCK=true, PRIEST=true, DRUID=true, SHAMAN=true }
+
+    local desired
+    if melee[classFile] then
+        desired = "Curse of Exhaustion"
+    elseif casters[classFile] then
+        desired = "Curse of Tongues"
+    end
+    if not desired then return false end
+
+    -- Only cast if that curse is actually missing
+    if TargetHasDotRobust(desired) then return false end
+
+    return cast(desired)
+end
+
+-- 3) PvE: Curse of the Elements (when PvP mode is OFF)
+local function CastCurseOfElements()
+    if TheoLock.pvpMode then return false end
+    if not safeHostileTarget() then return false end
+    if TargetHasDotRobust("Curse of the Elements") then return false end
+    return cast("Curse of the Elements")
+end
+
+-- 4) Corruption upkeep
+local function CastCorruption()
+    if not safeHostileTarget() then return false end
+    if TargetHasDotRobust("Corruption") then return false end
+    return cast("Corruption")
+end
+
+-- 5) Curse of Agony: only if no other warlock curse is present
+local function CastCurseOfAgony()
+    if not safeHostileTarget() then return false end
+    if TargetHasAnyWarlockCurse() then return false end
+    return cast("Curse of Agony")
+end
+
+-- 6) Siphon Life upkeep
+local function CastSiphonLife()
+    if not safeHostileTarget() then return false end
+    if TargetHasDotRobust("Siphon Life") then return false end
+    return cast("Siphon Life")
+end
+
+-- 7) Pet safety: Health Funnel if pet exists and <50% HP
+local function CastHealthFunnel()
+    if not UnitExists("pet") or UnitIsDeadOrGhost("pet") then return false end
+    if pct("pet") >= 0.50 then return false end
+    TheoLock.channelSpell = "Health Funnel"
+    return cast("Health Funnel")
+end
+
+-- 8) Self sustain: Drain Life if player <50% HP
+local function CastDrainLife()
+    if not safeHostileTarget() then return false end
+    if pct("player") >= 0.50 then return false end
+    return cast("Drain Life")
+end
+
+-- 9) Filler / execute: Drain Soul ONLY if all three core DoTs are present
+local function CastDrainSoulExecute()
+    if not safeHostileTarget() then return false end
+
+    local hasCorr = TargetHasDotRobust("Corruption")
+    local hasCoA  = TargetHasDotRobust("Curse of Agony")
+    local hasSL   = TargetHasDotRobust("Siphon Life")
+
+    if not (hasCorr and hasCoA and hasSL) then
+        return false
+    end
+
+    return cast("Drain Soul")
+end
+
+-- =====================================================================
+--  MAIN PULSE (called from /theolock, like the warrior rotation)
+-- =====================================================================
+
 function TheoLock:Pulse()
-    -- Respect ongoing Health Funnel
+    -- Never break an ongoing Health Funnel channel
     if TheoLock.isChanneling and TheoLock.channelSpell == "Health Funnel" then
         return
     end
 
-    -- ABSOLUTE TOP PRIO: Nightfall proc (Shadow Trance)
-    if safeHostileTarget() and HasBuff("player", "Shadow Trance") then
-        if cast("Shadow Bolt") then return end
-    end
+    -- Priority list, top to bottom:
 
-    -- PvP mode: class-targeted disruptive curse at TOP priority (after Nightfall)
-    if TheoLock.pvpMode and safeHostileTarget() then
-        local _, classFile = UnitClass("target")
-        if classFile then
-            local melee = { WARRIOR=true, PALADIN=true, HUNTER=true, ROGUE=true }
-            local castr = { MAGE=true, WARLOCK=true, PRIEST=true, DRUID=true, SHAMAN=true }
-            local desired
-            if melee[classFile] then
-                desired = "Curse of Exhaustion"
-            elseif castr[classFile] then
-                desired = "Curse of Tongues"
-            end
-            if desired and not TargetHasDotRobust(desired) and not recentlyCast(desired, 1.4) then
-                if cast(desired) then return end
-            end
-        end
-    end
+    -- 1) Nightfall proc: instant Shadow Bolt
+    if CastNightfallShadowBolt() then return end
 
-    -- NEW: Curse of the Elements (priority above Corr/CoA/SL)
-    if safeHostileTarget() and not TargetHasDotRobust("Curse of the Elements") and not recentlyCast("Curse of the Elements", 1.4) then
-        if cast("Curse of the Elements") then return end
-    end
+    -- 2) PvP disruptive curses (CoEx / CoT), when enabled
+    if CastPvPCurse() then return end
 
-    -- TOP PRIO BUCKET: Keep DoTs up (Corruption -> CoA -> Siphon Life)
-    if safeHostileTarget() and not TargetHasDotRobust("Corruption") and not recentlyCast("Corruption", 1.4) then
-        if cast("Corruption") then return end
-    end
+    -- 3) PvE: Curse of the Elements (only when PvP mode OFF)
+    if CastCurseOfElements() then return end
 
-    -- If we recently applied Corruption, strongly try CoA next if it’s missing
-    if safeHostileTarget() and GetTime() < (TheoLock.preferCoAUntil or 0)
-       and not TargetHasDotRobust("Curse of the Elements")
-       and not TargetHasDotRobust("Curse of Agony") and not recentlyCast("Curse of Agony", 1.4) then
-        if cast("Curse of Agony") then return end
-    end
+    -- 4) Core DoT upkeep
+    if CastCorruption() then return end
+    if CastCurseOfAgony() then return end
+    if CastSiphonLife() then return end
 
-    -- Regular CoA upkeep (if not already caught by the preference above)
-    if safeHostileTarget()
-       and not TargetHasDotRobust("Curse of the Elements")
-       and not TargetHasDotRobust("Curse of Agony") and not recentlyCast("Curse of Agony", 1.4) then
-        if cast("Curse of Agony") then return end
-    end
+    -- 5) Pet safety
+    if CastHealthFunnel() then return end
 
-    -- Siphon Life upkeep (same priority bucket as CoA, above fillers)
-    if safeHostileTarget() and not TargetHasDotRobust("Siphon Life") and not recentlyCast("Siphon Life", 1.4) then
-        if cast("Siphon Life") then return end
-    end
+    -- 6) Self sustain
+    if CastDrainLife() then return end
 
-    -- Pet safety: Health Funnel if pet exists and <50%
-    if UnitExists("pet") and not UnitIsDeadOrGhost("pet") and pct("pet") < 0.50 then
-        TheoLock.channelSpell = "Health Funnel"
-        if cast("Health Funnel") then return end
-    end
+    -- 7) Filler / execute
+    if CastDrainSoulExecute() then return end
 
-    -- Self sustain: Drain Life if player <50%
-    if safeHostileTarget() and pct("player") < 0.50 then
-        if cast("Drain Life") then return end
-    end
-
-    -- Filler / Execute: ONLY Drain Soul if all three core DoTs are present
-    if safeHostileTarget() then
-        local hasCorr = TargetHasDotRobust("Corruption")
-        local hasCoA  = TargetHasDotRobust("Curse of Agony")
-        local hasSL   = TargetHasDotRobust("Siphon Life")
-        if hasCorr and hasCoA and hasSL then
-            cast("Drain Soul")
-        end
-        -- else: do nothing; next press will attempt to (re)apply missing DoTs
-    end
+    -- Else: do nothing on this press; next press will try again
 end
 
 -- -------- Slash commands --------
+
 SLASH_THEOLOCK1 = "/theolock"
 SlashCmdList["THEOLOCK"] = function(msg)
     msg = string.lower(msg or "")
     if msg == "status" then
         DEFAULT_CHAT_FRAME:AddMessage(string.format(
-            "TheoLock: pvpMode=%s | chann=%s (%s) | last=%s age=%.1fs | preferCoA=%.1fs | pfTarget=%s",
+            "TheoLock: pvpMode=%s | chann=%s (%s) | last=%s age=%.1fs | pfTarget=%s",
             tostring(TheoLock.pvpMode),
             tostring(TheoLock.isChanneling),
             tostring(TheoLock.channelSpell or "none"),
             tostring(TheoLock.lastCastName or "none"),
             (GetTime() - (TheoLock.lastCastAt or 0)),
-            math.max(0, (TheoLock.preferCoAUntil or 0) - GetTime()),
             tostring((TheoLock.pfTargetFrame and (TheoLock.pfTargetFrame:GetName() or "unnamed")) or "nil")
         ))
         return
     end
+
     TheoLock:Pulse()
 end
 
--- /lockbg: toggle PvP mode on/off
+-- /lockbg: toggle PvP mode on/off (class-targeted curses)
 SLASH_LOCKBG1 = "/lockbg"
 SlashCmdList["LOCKBG"] = function()
     TheoLock.pvpMode = not TheoLock.pvpMode
-    DEFAULT_CHAT_FRAME:AddMessage("TheoLock PvP mode: " .. (TheoLock.pvpMode and "ON (class-targeted curses)" or "OFF"))
+    DEFAULT_CHAT_FRAME:AddMessage(
+        "TheoLock PvP mode: " ..
+        (TheoLock.pvpMode and "ON (class-targeted curses)" or "OFF")
+    )
 end
