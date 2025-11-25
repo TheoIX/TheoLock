@@ -22,6 +22,9 @@ TheoLock.pfScanCooldown = 0.25 -- seconds between heavy frame enumerations
 -- PvP mode toggle: /lockbg
 TheoLock.pvpMode        = false
 
+-- Main curse toggle: /coshadow (swap Elements <-> Shadow)
+TheoLock.curseShadow    = false
+
 -- -------- Small utils --------
 
 local function pct(unit)
@@ -70,6 +73,7 @@ local DOT_ICON_TAIL = {
     ["Curse of Exhaustion"]   = "Spell_Shadow_GrimWard",
     ["Curse of Tongues"]      = "Spell_Shadow_CurseOfTounges", -- note spelling
     ["Curse of the Elements"] = "Spell_Shadow_ChillTouch",
+    ["Curse of Shadow"]      = "Spell_Shadow_CurseOfAchimonde", -- best-effort icon key
 }
 
 local function HasDebuffByIcon(unit, spell)
@@ -201,6 +205,7 @@ local function TargetHasAnyWarlockCurse()
         or TargetHasDotRobust("Curse of Exhaustion")
         or TargetHasDotRobust("Curse of Tongues")
         or TargetHasDotRobust("Curse of the Elements")
+        or TargetHasDotRobust("Curse of Shadow")
 end
 
 local function safeHostileTarget()
@@ -280,12 +285,17 @@ local function CastPvPCurse()
     return cast(desired)
 end
 
--- 3) PvE: Curse of the Elements (when PvP mode is OFF)
-local function CastCurseOfElements()
+-- 3) PvE: Main curse (when PvP mode is OFF)
+--     Default: Curse of the Elements
+--     /coshadow: swap to Curse of Shadow
+local function CastMainCurse()
     if TheoLock.pvpMode then return false end
     if not safeHostileTarget() then return false end
-    if TargetHasDotRobust("Curse of the Elements") then return false end
-    return cast("Curse of the Elements")
+
+    local desired = TheoLock.curseShadow and "Curse of Shadow" or "Curse of the Elements"
+    if TargetHasDotRobust(desired) then return false end
+
+    return cast(desired)
 end
 
 -- 4) Corruption upkeep
@@ -295,10 +305,10 @@ local function CastCorruption()
     return cast("Corruption")
 end
 
--- 5) Curse of Agony: only if no other warlock curse is present
+-- 5) Curse of Agony: cast ONLY if Curse of Agony is missing (ignore other curses)
 local function CastCurseOfAgony()
     if not safeHostileTarget() then return false end
-    if TargetHasAnyWarlockCurse() then return false end
+    if TargetHasDotRobust("Curse of Agony") then return false end
     return cast("Curse of Agony")
 end
 
@@ -357,8 +367,8 @@ function TheoLock:Pulse()
     -- 2) PvP disruptive curses (CoEx / CoT), when enabled
     if CastPvPCurse() then return end
 
-    -- 3) PvE: Curse of the Elements (only when PvP mode OFF)
-    if CastCurseOfElements() then return end
+    -- 3) PvE: Main curse (Elements by default, or Shadow via /coshadow)
+    if CastMainCurse() then return end
 
     -- 4) Core DoT upkeep
     if CastCorruption() then return end
@@ -405,5 +415,15 @@ SlashCmdList["LOCKBG"] = function()
     DEFAULT_CHAT_FRAME:AddMessage(
         "TheoLock PvP mode: " ..
         (TheoLock.pvpMode and "ON (class-targeted curses)" or "OFF")
+    )
+end
+
+-- /coshadow: toggle main curse between CoE and CoS (PvE only)
+SLASH_COSHADOW1 = "/coshadow"
+SlashCmdList["COSHADOW"] = function()
+    TheoLock.curseShadow = not TheoLock.curseShadow
+    DEFAULT_CHAT_FRAME:AddMessage(
+        "TheoLock main curse: " ..
+        (TheoLock.curseShadow and "Curse of Shadow" or "Curse of the Elements")
     )
 end
